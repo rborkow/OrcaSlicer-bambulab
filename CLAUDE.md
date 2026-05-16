@@ -232,3 +232,97 @@ ctest --test-dir ./tests/sla_print/sla_print_tests
 - **Performance benchmarks** help catch performance regressions
 - **Memory leak** detection important for long-running GUI application
 - **Cross-platform** testing required before releases
+
+## Fork Purpose: Bambu Lab Connectivity
+
+This fork (`OrcaSlicer-bambulab`) preserves the original Bambu Lab network stack
+that upstream OrcaSlicer removed/gated. The Bambu sources are compiled
+unconditionally and exposed alongside the Orca cloud agent through a factory so
+users can pick which provider to use at runtime via `AppConfig`
+(`use_orca_cloud`).
+
+### Component map
+
+- **Plugin loader** — `src/slic3r/Utils/BBLNetworkPlugin.{hpp,cpp}`
+  Loads the proprietary `BambuNetwork_<ver>` DLL/dylib/so at runtime via
+  `GetProcAddress` / `dlsym`. Entry point: `GUI_App.cpp` ≈ L3780–3818
+  (`NetworkAgent::initialize_network_module`), gated by the
+  `installed_networking` config flag (≈ L1512, L3725).
+- **Cloud agent** — `src/slic3r/Utils/BBLCloudServiceAgent.{cpp,hpp}`
+  Wraps the plugin's auth/session/cert/log calls and supplies the OAuth login
+  URL. Bambu endpoints (`api.bambulab.com` / `api.bambulab.cn`) are referenced
+  in `GUI_App.cpp` ≈ L1145, L1160.
+- **Printer agent** — `src/slic3r/Utils/BBLPrinterAgent.{cpp,hpp}`
+  Routes print jobs through plugin entry points (`start_print`,
+  `start_local_print`, `start_sdcard_print`).
+- **Tunnel/protocol** — `src/slic3r/GUI/Printer/BambuTunnel.h` plus
+  `PrinterFileSystem.{h,cpp}` (inherits `BambuLib`). Binary tunnel handles
+  MQTT-style control, file ops, and camera/video streams.
+- **Factory** — `src/slic3r/Utils/NetworkAgentFactory.{hpp,cpp}`
+  `enum CloudAgentProvider { Orca, BBL }`. `create_cloud_agent()` returns BBL
+  if the plugin loaded, else falls back to Orca.
+  `create_agent_from_config()` reads `use_orca_cloud`; WSL2 + Linux bridge
+  forces BBL.
+- **WSL2 / Linux bridge forwarder** —
+  `src/slic3r/Utils/PJarczakLinuxBridge/PJarczakBambuNetworkForwarderExports.cpp`
+  Lets Windows builds reach the Linux-only plugin through a helper process;
+  fallback host `https://bambulab.com`.
+- **Build wiring** — `src/slic3r/CMakeLists.txt` ≈ L41–47, L618–623 compiles
+  the BBL sources unconditionally (no `#ifdef DISABLE_BBL`-style gates).
+
+### What "re-enabling" actually means here
+
+There is no protocol rewrite. The fork:
+1. Keeps the BBL source files compiled.
+2. Keeps the `BambuNetwork` plugin loader + entry-point bindings.
+3. Adds a factory layer so BBL and Orca agents can coexist and be selected at
+   runtime.
+4. Adds the `PJarczakLinuxBridge` forwarder so Windows builds reach the
+   Linux plugin via WSL2.
+
+The proprietary `BambuNetwork_*` binary itself is **not** in this repo — it is
+loaded from `plugins/` at runtime. Authentication/MQTT/FTP logic lives inside
+that DLL; this codebase only binds to its exported symbols.
+
+### Git history caveat
+
+The repo currently has only two commits (`Initial release` + a CI fix), so
+there is no incremental diff against upstream to inspect. Treat the "Component
+map" above as the inventory of files that an agent should diff against
+upstream `SoftFever/OrcaSlicer` when asked "what was changed?".
+
+## Agent Ergonomics
+
+Tips for agents (and humans) working in this repo:
+
+- **Develop on `claude/orcaslicer-bambu-connection-30m4d`.** All pushes go to
+  that branch; do not push to `main` without explicit permission.
+- **GitHub access is restricted to `rborkow/orcaslicer-bambulab`.** Use the
+  `mcp__github__*` tools — there is no `gh` CLI in this environment.
+- **Don't run full builds speculatively.** A full CMake build of this tree is
+  multi-hour and downloads dependencies in `deps/build/`. Only build when
+  diagnosing an actual build issue, and follow the per-platform commands
+  above.
+- **For codebase exploration, prefer the `Explore` agent.** The tree is
+  ~500k LOC; a thorough `Explore` run is faster and uses less main-context
+  than ad-hoc `grep`/`find` loops.
+- **Bambu connection investigations start at the Component map above.** Begin
+  at `BBLNetworkPlugin`, then `NetworkAgentFactory`, then the specific agent
+  (`BBLCloudServiceAgent` for auth/cloud, `BBLPrinterAgent` for jobs,
+  `PrinterFileSystem`/`BambuTunnel` for device I/O).
+- **Don't try to run or test connectivity end-to-end** — it requires the
+  proprietary `BambuNetwork_*` plugin binary which is not in this repo, plus
+  real Bambu credentials and (on Windows) a WSL2 Linux bridge.
+- **CMake quirks**: minimum 3.13, capped at 3.31.x on Windows; Linux uses
+  Ninja; macOS defaults to Xcode (Ninja with `-x`). Build artifacts land in
+  `build/` (or `build/arm64/` on macOS/Linux per the commands above).
+- **Test discovery**: tests are Catch2 under `tests/`; run with `ctest` from
+  the build dir. Don't add new test directories without wiring them into
+  `tests/CMakeLists.txt`.
+- **Avoid touching `resources/profiles/`** unless the task is explicitly
+  about printer/material profiles — accidental edits there break
+  user-visible printer support.
+- **The `installed_networking` AppConfig flag** is the master switch for
+  loading the BBL plugin; if connectivity is silently disabled in a session,
+  check that flag and the presence of the plugin binary under `plugins/`
+  before chasing code paths.
